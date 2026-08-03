@@ -30,15 +30,3 @@ npm run preview  # 预览构建产物
 3. 填写实验参数（轮数、主题、双方性格、风格、备注、批量数量）。
 4. 点击「批量生成对话」，等待生成完成后勾选满意的对话。
 5. 点击「导出选中 CSV」下载文件。
-
-## GitHub Pages 部署
-
-仓库已包含 `.github/workflows/deploy.yml`，推送 `main` 分支后自动构建并部署。
-
-首次部署需在仓库页面开启 Pages：
-
-**Settings → Pages → Build and deployment → Source 选择 "GitHub Actions"**
-
-部署完成后访问地址为 `https://<用户名>.github.io/<仓库名>/`。
-
-> ⚠️ 注意：纯前端部署意味着浏览器会直接调用 DashScope 接口。请勿将 API Key 硬编码进代码仓库（本项目通过页面设置项注入，不会提交到 Git）。
