@@ -1,0 +1,44 @@
+# 共情对话生成平台 (Dialogue Generator)
+
+基于通义千问（Qwen）大模型的可控对话素材构建工具，供心理学共情实验的研究人员批量生成、筛选并导出虚拟人物对话。
+
+## 功能
+
+- **访问口令验证**：进入页面前需输入访问口令
+- **实验参数配置**：对话轮数、对话主题、角色A/角色B 性格特点、对话风格、备注
+- **批量生成**：一次生成 1~10 段候选对话（并发调用大模型）
+- **对话预览**：聊天气泡形式展示每段对话，支持勾选、删除
+- **CSV 导出**：导出选中 / 全部 / 单段对话，含实验参数元数据，UTF-8 BOM 编码可直接用 Excel 打开
+
+## 技术栈
+
+React + TypeScript + Vite + Tailwind CSS，纯静态站点，可直接部署到 GitHub Pages。
+
+## 本地开发
+
+```bash
+npm install
+npm run dev      # 开发服务器 http://localhost:3000
+npm run build    # 构建到 dist/
+npm run preview  # 预览构建产物
+```
+
+## 使用说明
+
+1. 输入访问口令进入系统。
+2. 点击右上角「设置」，填入通义千问 API Key（阿里云百炼 DashScope），模型默认为 `qwen3.7-max`，可按需修改。API Key 仅保存在本地浏览器 localStorage 中，不会上传。
+3. 填写实验参数（轮数、主题、双方性格、风格、备注、批量数量）。
+4. 点击「批量生成对话」，等待生成完成后勾选满意的对话。
+5. 点击「导出选中 CSV」下载文件。
+
+## GitHub Pages 部署
+
+仓库已包含 `.github/workflows/deploy.yml`，推送 `main` 分支后自动构建并部署。
+
+首次部署需在仓库页面开启 Pages：
+
+**Settings → Pages → Build and deployment → Source 选择 "GitHub Actions"**
+
+部署完成后访问地址为 `https://<用户名>.github.io/<仓库名>/`。
+
+> ⚠️ 注意：纯前端部署意味着浏览器会直接调用 DashScope 接口。请勿将 API Key 硬编码进代码仓库（本项目通过页面设置项注入，不会提交到 Git）。
