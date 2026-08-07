@@ -9,10 +9,14 @@ const AUTH_KEY = 'dg-auth'
 const KEY_STORAGE = 'dg-api-key'
 const MODEL_A_STORAGE = 'dg-model-agent1'
 const MODEL_B_STORAGE = 'dg-model-agent2'
+const REVIEWER2_STORAGE = 'dg-model-reviewer2'
+const DUAL_STORAGE = 'dg-dual-review'
+const DIVERGENCE_STORAGE = 'dg-divergence'
 const THRESHOLD_STORAGE = 'dg-threshold'
 const AUTOSCORE_STORAGE = 'dg-autoscore'
 const DEFAULT_MODEL_A = 'qwen3.7-max'
 const DEFAULT_MODEL_B = 'qwen-plus'
+const DEFAULT_REVIEWER2 = 'qwen-max'
 const ENDPOINT = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'
 const QWEN_MODELS = ['qwen3.7-max', 'qwen-max', 'qwen-plus', 'qwen-turbo', 'qwen-long']
 const SCORE_DIMS = ['主题契合度', '角色性格一致性', '对话风格符合度', '共情激发潜力', '结构与轮数合规性']
@@ -33,6 +37,13 @@ interface DimensionScore {
   evidence: string
 }
 
+interface ReviewerReport {
+  model: string
+  dimensions: DimensionScore[]
+  total: number
+  comment: string
+}
+
 interface DialogueScore {
   dimensions: DimensionScore[]
   total: number
@@ -40,6 +51,12 @@ interface DialogueScore {
   comment: string
   passed: boolean
   model: string
+  /** 双评审模式下的各评审原始报告 */
+  reviewers?: ReviewerReport[]
+  /** 双评审总分差 */
+  divergence?: number
+  /** 分差过大，建议人工复核 */
+  needsReview?: boolean
 }
 
 interface Dialogue {
@@ -178,7 +195,7 @@ async function generateDialogue(
   throw new Error(`生成结果连续未通过校验：${lastProblem}`)
 }
 
-/* ================= Agent 2：评审打分（按维度 + evidence） ================= */
+/* ================= Agent 2：评审打分（按维度 + evidence，支持双评审共识） ================= */
 
 function buildScorePrompt(d: Dialogue): string {
   const transcript = d.turns.map((t, i) => `${i + 1}. ${t.speaker}：${t.content}`).join('\n')
@@ -206,7 +223,7 @@ ${transcript}
 {"dimensions": [{"name": "维度名", "score": 0到10的整数, "evidence": "引用具体发言的评分依据"}, ...共5项], "comment": "总体评价（1~2句话，指出主要优点和问题）"}`
 }
 
-function parseScore(raw: string, threshold: number, model: string): DialogueScore {
+function parseReviewerReport(raw: string, model: string): ReviewerReport {
   const obj = extractJson(raw) as {
     dimensions?: { name?: string; score?: number; evidence?: string }[]
     comment?: string
@@ -222,18 +239,10 @@ function parseScore(raw: string, threshold: number, model: string): DialogueScor
   }))
   // 总分由程序重新求和，不信任模型自报的总分（防止加总幻觉）
   const total = dimensions.reduce((s, d) => s + d.score, 0)
-  const maxTotal = dimensions.length * 10
-  return {
-    dimensions,
-    total,
-    maxTotal,
-    comment: String(obj.comment ?? ''),
-    passed: total >= threshold,
-    model,
-  }
+  return { model, dimensions, total, comment: String(obj.comment ?? '') }
 }
 
-async function scoreDialogue(apiKey: string, model: string, d: Dialogue, threshold: number): Promise<DialogueScore> {
+async function reviewOnce(apiKey: string, model: string, d: Dialogue): Promise<ReviewerReport> {
   const raw = await chat(
     apiKey,
     model,
@@ -247,7 +256,57 @@ async function scoreDialogue(apiKey: string, model: string, d: Dialogue, thresho
     ],
     0.2, // 低温度，保证评分稳定可复现
   )
-  return parseScore(raw, threshold, model)
+  return parseReviewerReport(raw, model)
+}
+
+/** 单评审 */
+async function scoreDialogue(apiKey: string, model: string, d: Dialogue, threshold: number): Promise<DialogueScore> {
+  const r = await reviewOnce(apiKey, model, d)
+  return {
+    dimensions: r.dimensions,
+    total: r.total,
+    maxTotal: r.dimensions.length * 10,
+    comment: r.comment,
+    passed: r.total >= threshold,
+    model,
+  }
+}
+
+/** 双评审共识：两位独立评审，维度分取平均；总分差过大则标记需人工复核 */
+async function scoreDialogueDual(
+  apiKey: string,
+  model1: string,
+  model2: string,
+  d: Dialogue,
+  threshold: number,
+  divergenceLimit: number,
+): Promise<DialogueScore> {
+  const [r1, r2] = await Promise.all([
+    reviewOnce(apiKey, model1, d),
+    reviewOnce(apiKey, model2, d),
+  ])
+  // 共识维度分：两评审取平均（四舍五入）；evidence 合并双方依据
+  const dimensions: DimensionScore[] = r1.dimensions.map((dim, i) => {
+    const other = r2.dimensions[i]
+    return {
+      name: dim.name,
+      score: Math.round((dim.score + (other?.score ?? dim.score)) / 2),
+      evidence: `[${model1}] ${dim.evidence || '（无）'} ｜ [${model2}] ${other?.evidence || '（无）'}`,
+    }
+  })
+  const total = dimensions.reduce((s, x) => s + x.score, 0)
+  const divergence = Math.abs(r1.total - r2.total)
+  return {
+    dimensions,
+    total,
+    maxTotal: dimensions.length * 10,
+    comment: r2.comment ? `${r1.comment} ｜ ${r2.comment}` : r1.comment,
+    passed: total >= threshold,
+    model: `${model1} + ${model2}`,
+    reviewers: [r1, r2],
+    divergence,
+    needsReview: divergence > divergenceLimit,
+  }
 }
 
 /* ================= CSV 导出 ================= */
@@ -265,7 +324,9 @@ function exportCSV(dialogues: Dialogue[], ranks: Map<number, number>, filename: 
   const header = [
     'dialogue_id', 'rank', 'topic', 'rounds', 'persona_a', 'persona_b', 'style', 'notes',
     'turn_index', 'speaker', 'content',
-    'score_total', 'score_max', 'score_passed', 'score_dimensions', 'score_comment', 'scored_by',
+    'score_total', 'score_max', 'score_passed', 'needs_review', 'divergence',
+    'reviewer1', 'reviewer1_total', 'reviewer2', 'reviewer2_total',
+    'score_dimensions', 'score_comment', 'scored_by',
   ]
   const rows = dialogues.flatMap((d) =>
     d.turns.map((t, i) => [
@@ -275,6 +336,10 @@ function exportCSV(dialogues: Dialogue[], ranks: Map<number, number>, filename: 
       i + 1, t.speaker, t.content,
       d.score?.total ?? '', d.score?.maxTotal ?? '',
       d.score ? (d.score.passed ? 'PASS' : 'FAIL') : '',
+      d.score?.needsReview ? 'YES' : '',
+      d.score?.divergence ?? '',
+      d.score?.reviewers?.[0]?.model ?? '', d.score?.reviewers?.[0]?.total ?? '',
+      d.score?.reviewers?.[1]?.model ?? '', d.score?.reviewers?.[1]?.total ?? '',
       d.score ? scoreSummary(d.score) : '',
       d.score?.comment ?? '', d.score?.model ?? '',
     ] as const),
@@ -346,6 +411,9 @@ export default function Home() {
     () => localStorage.getItem(MODEL_A_STORAGE) || localStorage.getItem('dg-model') || DEFAULT_MODEL_A,
   )
   const [agent2Model, setAgent2Model] = useState(() => localStorage.getItem(MODEL_B_STORAGE) || DEFAULT_MODEL_B)
+  const [reviewer2Model, setReviewer2Model] = useState(() => localStorage.getItem(REVIEWER2_STORAGE) || DEFAULT_REVIEWER2)
+  const [dualReview, setDualReview] = useState(() => localStorage.getItem(DUAL_STORAGE) === '1')
+  const [divergenceLimit, setDivergenceLimit] = useState(() => Number(localStorage.getItem(DIVERGENCE_STORAGE)) || 8)
   const [threshold, setThreshold] = useState(() => Number(localStorage.getItem(THRESHOLD_STORAGE)) || 35)
   const [autoScore, setAutoScore] = useState(() => localStorage.getItem(AUTOSCORE_STORAGE) !== '0')
   const [showSettings, setShowSettings] = useState(false)
@@ -371,6 +439,9 @@ export default function Home() {
   useEffect(() => localStorage.setItem(KEY_STORAGE, apiKey), [apiKey])
   useEffect(() => localStorage.setItem(MODEL_A_STORAGE, agent1Model), [agent1Model])
   useEffect(() => localStorage.setItem(MODEL_B_STORAGE, agent2Model), [agent2Model])
+  useEffect(() => localStorage.setItem(REVIEWER2_STORAGE, reviewer2Model), [reviewer2Model])
+  useEffect(() => localStorage.setItem(DUAL_STORAGE, dualReview ? '1' : '0'), [dualReview])
+  useEffect(() => localStorage.setItem(DIVERGENCE_STORAGE, String(divergenceLimit)), [divergenceLimit])
   useEffect(() => localStorage.setItem(THRESHOLD_STORAGE, String(threshold)), [threshold])
   useEffect(() => localStorage.setItem(AUTOSCORE_STORAGE, autoScore ? '1' : '0'), [autoScore])
 
@@ -397,6 +468,7 @@ export default function Home() {
   const selectedDialogues = useMemo(() => dialogues.filter((d) => d.selected), [dialogues])
   const scoredCount = useMemo(() => dialogues.filter((d) => d.score).length, [dialogues])
   const passedCount = useMemo(() => dialogues.filter((d) => d.score?.passed).length, [dialogues])
+  const reviewCount = useMemo(() => dialogues.filter((d) => d.score?.needsReview).length, [dialogues])
 
   if (!authed) return <LoginGate onPass={() => setAuthed(true)} />
 
@@ -405,6 +477,10 @@ export default function Home() {
   const validate = (): string | null => {
     if (!apiKey.trim()) return '请先在右上角「设置」中填写通义千问 API Key'
     if (!agent1Model.trim() || !agent2Model.trim()) return '请在「设置」中为 Agent1 和 Agent2 选择模型'
+    if (dualReview) {
+      if (!reviewer2Model.trim()) return '双评审模式下请为「评审模型 B」选择模型'
+      if (agent2Model.trim() === reviewer2Model.trim()) return '双评审模式下两个评审模型不能相同，否则共识没有意义'
+    }
     if (!form.topic.trim()) return '请填写对话主题'
     if (!form.personaA.trim() || !form.personaB.trim()) return '请填写双方的性格特点'
     if (!form.style.trim()) return '请填写对话风格'
@@ -412,6 +488,12 @@ export default function Home() {
     if (form.batch < 1 || form.batch > 10) return '批量生成数量需在 1~10 之间'
     return null
   }
+
+  /** 对一段对话执行评分（按当前设置自动选择单/双评审） */
+  const scoreOne = (d: Dialogue): Promise<DialogueScore> =>
+    dualReview
+      ? scoreDialogueDual(apiKey.trim(), agent2Model.trim(), reviewer2Model.trim(), d, threshold, divergenceLimit)
+      : scoreDialogue(apiKey.trim(), agent2Model.trim(), d, threshold)
 
   /** 对一组对话执行 Agent2 评分（内部复用） */
   const runScoring = async (targets: Dialogue[]) => {
@@ -421,7 +503,7 @@ export default function Home() {
     const scoreErrors: string[] = []
     const results = await Promise.allSettled(
       targets.map((d) =>
-        scoreDialogue(apiKey.trim(), agent2Model.trim(), d, threshold).then((s) => {
+        scoreOne(d).then((s) => {
           setScoreProgress((p) => ({ ...p, done: p.done + 1 }))
           return { id: d.id, score: s }
         }),
@@ -432,11 +514,12 @@ export default function Home() {
       if (r.status === 'fulfilled') scoreMap.set(r.value.id, r.value.score)
       else scoreErrors.push(`评分失败：${r.reason?.message || r.reason}`)
     })
-    // 写入评分，并自动勾选通过预筛选的对话
+    // 写入评分；自动勾选「通过且无需人工复核」的对话
     setDialogues((prev) =>
-      prev.map((d) =>
-        scoreMap.has(d.id) ? { ...d, score: scoreMap.get(d.id)!, selected: scoreMap.get(d.id)!.passed } : d,
-      ),
+      prev.map((d) => {
+        const s = scoreMap.get(d.id)
+        return s ? { ...d, score: s, selected: s.passed && !s.needsReview } : d
+      }),
     )
     if (scoreErrors.length) setErrors((prev) => [...prev, ...scoreErrors])
     setScoring(false)
@@ -492,9 +575,8 @@ export default function Home() {
 
   /** 手动触发：对所有未评分对话执行 Agent2 评分 */
   const scoreAll = async () => {
-    const err = !apiKey.trim() ? '请先在「设置」中填写 API Key' : null
-    if (err) {
-      setErrors([err])
+    if (!apiKey.trim()) {
+      setErrors(['请先在「设置」中填写 API Key'])
       return
     }
     await runScoring(dialogues.filter((d) => !d.score))
@@ -520,7 +602,8 @@ export default function Home() {
     setDialogues((prev) => prev.map((d) => (d.id === id ? { ...d, selected: !d.selected } : d)))
   const remove = (id: number) => setDialogues((prev) => prev.filter((d) => d.id !== id))
   const selectAll = (v: boolean) => setDialogues((prev) => prev.map((d) => ({ ...d, selected: v })))
-  const selectPassed = () => setDialogues((prev) => prev.map((d) => ({ ...d, selected: !!d.score?.passed })))
+  const selectPassed = () =>
+    setDialogues((prev) => prev.map((d) => ({ ...d, selected: !!d.score?.passed && !d.score?.needsReview })))
 
   const stamp = () => {
     const d = new Date()
@@ -581,7 +664,7 @@ export default function Home() {
                 <p className="text-xs text-gray-400 mt-1">负责按要求生成对话（默认 {DEFAULT_MODEL_A}）</p>
               </div>
               <div>
-                <label className={labelCls}>Agent 2 · 评分模型</label>
+                <label className={labelCls}>Agent 2 · 评审模型 A</label>
                 <input
                   type="text"
                   list="qwen-models"
@@ -598,6 +681,49 @@ export default function Home() {
                   负责打分排名（默认 {DEFAULT_MODEL_B}，建议与 Agent1 不同以降低同源偏差）
                 </p>
               </div>
+
+              {/* 双评审共识 */}
+              <div className="md:col-span-2 border border-gray-200 rounded-lg p-4 bg-gray-50/60">
+                <label className="flex items-center gap-2 text-sm font-medium text-gray-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={dualReview}
+                    onChange={(e) => setDualReview(e.target.checked)}
+                    className="h-4 w-4 accent-[#003399]"
+                  />
+                  双评审共识模式（两个不同模型独立评分，取共识，分歧过大标记人工复核）
+                </label>
+                {dualReview && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">
+                    <div>
+                      <label className={labelCls}>评审模型 B</label>
+                      <input
+                        type="text"
+                        list="qwen-models"
+                        value={reviewer2Model}
+                        onChange={(e) => setReviewer2Model(e.target.value)}
+                        className={inputCls}
+                      />
+                      <p className="text-xs text-gray-400 mt-1">默认 {DEFAULT_REVIEWER2}，必须与评审模型 A 不同</p>
+                    </div>
+                    <div>
+                      <label className={labelCls}>分歧阈值（总分差）</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={50}
+                        value={divergenceLimit}
+                        onChange={(e) => setDivergenceLimit(Number(e.target.value))}
+                        className={inputCls}
+                      />
+                      <p className="text-xs text-gray-400 mt-1">
+                        两位评审总分差 &gt; 该值时标记「需人工复核」，不自动勾选
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <div>
                 <label className={labelCls}>预筛选及格线（满分 50）</label>
                 <input
@@ -750,7 +876,8 @@ export default function Home() {
           <section className="space-y-4">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
               <h2 className="font-semibold text-gray-800 mr-auto">
-                候选对话（共 {dialogues.length} 段 · 已评分 {scoredCount} · 通过 {passedCount} · 已选{' '}
+                候选对话（共 {dialogues.length} 段 · 已评分 {scoredCount} · 通过 {passedCount}
+                {reviewCount > 0 && <span className="text-amber-600"> · 需复核 {reviewCount}</span>} · 已选{' '}
                 {selectedDialogues.length}）
               </h2>
               <button onClick={() => selectAll(true)} className="text-sm text-[#003399] hover:underline">
@@ -823,6 +950,11 @@ export default function Home() {
                         >
                           {d.score.passed ? 'PASS' : 'FAIL'} {d.score.total}/{d.score.maxTotal}
                         </span>
+                        {d.score.needsReview && (
+                          <span className="text-xs font-semibold text-amber-700 bg-amber-100 rounded-full px-2.5 py-0.5">
+                            需人工复核（分差 {d.score.divergence}）
+                          </span>
+                        )}
                         <span className="text-xs text-gray-500">排名 #{ranks.get(d.id)}</span>
                         <span className="text-xs text-gray-400">评审：{d.score.model}</span>
                       </>
@@ -874,7 +1006,9 @@ export default function Home() {
                 {/* Agent2 评审报告 */}
                 {d.score && (
                   <div className="mt-4 border-t border-gray-100 pt-4">
-                    <div className="text-xs font-semibold text-gray-500 mb-2">Agent2 评审报告</div>
+                    <div className="text-xs font-semibold text-gray-500 mb-2">
+                      Agent2 评审报告{d.score.reviewers && '（双评审共识）'}
+                    </div>
                     <div className="space-y-2">
                       {d.score.dimensions.map((dim, i) => (
                         <div key={i} className="text-xs">
@@ -888,10 +1022,21 @@ export default function Home() {
                             </div>
                             <span className="w-8 text-right font-medium text-gray-700">{dim.score}</span>
                           </div>
-                          {dim.evidence && <p className="text-gray-400 mt-0.5 ml-30 pl-30 md:ml-[7.5rem]">依据：{dim.evidence}</p>}
+                          {dim.evidence && (
+                            <p className="text-gray-400 mt-0.5 md:ml-[7.5rem]">依据：{dim.evidence}</p>
+                          )}
                         </div>
                       ))}
                     </div>
+                    {d.score.reviewers && (
+                      <div className="flex flex-wrap gap-x-4 gap-y-1 mt-3">
+                        {d.score.reviewers.map((r, i) => (
+                          <span key={i} className="text-xs text-gray-500 bg-gray-50 rounded-lg px-3 py-1.5">
+                            评审{i + 1}（{r.model}）：{r.total}/{d.score!.maxTotal} 分 — {r.comment}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     {d.score.comment && (
                       <p className="text-xs text-gray-500 mt-2 bg-gray-50 rounded-lg px-3 py-2">
                         总评：{d.score.comment}
